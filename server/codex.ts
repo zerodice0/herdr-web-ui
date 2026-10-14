@@ -64,6 +64,17 @@ function contentText(value: unknown, user = false): string {
   }).join("\n");
 }
 
+/** Native image wrappers are metadata only when the entire input_text borders an image block. */
+function nativeImageEnvelope(content: unknown[], index: number): boolean {
+  const part = record(content[index]);
+  if (part.type !== "input_text" || typeof part.text !== "string") return false;
+  const text = part.text.trim();
+  const adjacent = text === "</image>" ? content[index - 1]
+    : /^<image name=\[Image #\d+\](?: path="[^"]*")?>$/.test(text) ? content[index + 1] : undefined;
+  const type = record(adjacent).type;
+  return type === "input_image" || type === "local_image";
+}
+
 function entries(text: string): RecordValue[] {
   return text.split("\n").flatMap((line) => {
     try { return [record(JSON.parse(line))]; } catch { return []; }
@@ -268,7 +279,7 @@ export function createCodexTranscriptParser(state: CodexParseState = { turns: []
             const skill = selectedSkill(string(record(block).text));
             return skill ? [skill] : [];
           });
-          const visible = content.filter((block) => !selectedSkill(string(record(block).text)));
+          const visible = content.filter((block, index) => !nativeImageEnvelope(content, index) && !selectedSkill(string(record(block).text)));
           message("user", contentText(visible, true), "response", ts, undefined, codexImageParts(entry));
           for (const skill of skills) {
             const turn = assistant(ts);
