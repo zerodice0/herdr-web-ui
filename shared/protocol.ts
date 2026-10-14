@@ -453,10 +453,10 @@ export type ConversationPart =
     skill?: SkillActivity;
     /** set when `output` was cut: the call's id, for GET /api/pane/conversation/tool-output, and the whole output's length */
     output_ref?: string; output_size?: number;
-    /** images the call returned (pi reads a picture into the result); same fetch as a user image */
+    /** Recorded images returned by Claude Code, Codex, OpenCode, pi, omp, omo or gjc; same on-demand fetch as a user image. */
     images?: { media_type: string; ref: string }[];
   }
-  /** A native Claude/Codex user image, addressed by an opaque ref and fetched on demand: GET /api/pane/conversation/image?pane_id=…&ref=… */
+  /** A native Claude Code/Codex/OpenCode/pi/omp/omo/gjc user image, addressed by an opaque ref and fetched on demand: GET /api/pane/conversation/image?pane_id=…&ref=… */
   | { kind: "image"; media_type: string; ref: string }
   /** the summary a compaction left; the conversation before it is what it sums up */
   | { kind: "compact"; text: string }

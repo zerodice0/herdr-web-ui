@@ -1,6 +1,7 @@
 /** Shared native-record rules keep paging, rendering and on-demand results consistent. */
 import type { ConversationPart, ConversationTurn, OmoTaskResult } from "../shared/protocol.ts";
 import type { SubagentDetail, TaskNotification } from "./claude-subagents.ts";
+import { imageType, MAX_IMAGE_BYTES } from "./image-bytes.ts";
 import { skillInvocationPrompt } from "./skill-activity.ts";
 import { trimOutput } from "./tool-output.ts";
 
@@ -18,6 +19,19 @@ export function isContextClear(value: unknown, source: string): boolean {
   if (entry.type !== "user" || entry.isMeta || entry.isCompactSummary || message.role !== "user" || typeof message.content !== "string") return false;
   // Require a whole local-command envelope; quoting /clear in prose is not a reset.
   return /^\s*<command-name>\s*\/clear\s*<\/command-name>(?:\s*<command-message>clear<\/command-message>)?(?:\s*<command-args>\s*<\/command-args>)?\s*$/.test(message.content);
+}
+
+/** Asset reads share the reset boundary even when their ref predates /clear. */
+export function activeHistoryText(text: string, source: string): string {
+  if (source === "codex-transcript") return text;
+  let start = 0, offset = 0;
+  for (const line of text.split("\n")) {
+    if (line.includes("context_clear") || line.includes("/clear")) {
+      try { if (isContextClear(JSON.parse(line), source)) start = offset + line.length + 1; } catch { /* torn line */ }
+    }
+    offset += line.length + 1;
+  }
+  return text.slice(start);
 }
 
 /**
@@ -69,44 +83,84 @@ export function piMessage(value: unknown): Row | null {
   return { ...message, toolCallId: string(message.toolCallId, message.callId), content };
 }
 
+/** Pi-family image refs are shared by the parser and the readers, including omp's `|` call ids. */
+export const PI_IMAGE_REF = /^pi:([A-Za-z0-9_:.\-|]{1,128}):(\d{1,3})$/;
+export const PI_USER_IMAGE_REF = /^pi-user:([A-Za-z0-9_:.\-|]{1,128}):(\d{1,3})$/;
+export const BLOB_IMAGE_REF = /^blob:([0-9a-f]{64})$/;
+const BLOB_IMAGE_DATA = /^blob:sha256:([0-9a-f]{64})$/;
+type PiImage = { media_type: string; data: string };
+
 /**
- * One entry's tool results, with the images each carries. pi reads a picture into a tool
- * result as inline base64 beside the text it returns, so only the position is carried in the
- * page: the bytes stay in the file and are fetched when the row is opened, the same way a
- * user-pasted image is. `index` counts the images of that one result, which is what the
- * page's ref quotes, so a fetch never has to agree with the parse about anything else.
+ * One entry's tool results, with its supported recorded images. Inline images are
+ * addressed by their position among supported images; blobs have a content address.
+ * Generated images live in xdev details, not the tool's inline-preview text.
  */
-export function piResults(message: Row): { id: string; text: string; error: boolean; images: string[] }[] {
+export function piResults(message: Row): { id: string; text: string; error: boolean; images: PiImage[] }[] {
   const blocks = message.role === "toolResult" ? [message] : Array.isArray(message.content) ? message.content.filter((block) => record(block).type === "toolResult") : [];
   return blocks.flatMap((value) => {
     const block = record(value);
     if (typeof block.toolCallId !== "string") return [];
-    const images = (Array.isArray(block.content) ? block.content : []).map(piImageOf).filter((image): image is { media_type: string; data: string } => image !== null).map((image) => image.media_type);
-    return [{ id: block.toolCallId, text: resultText(block.content), error: block.isError === true, images }];
+    return [{ id: block.toolCallId, text: resultText(block.content), error: block.isError === true, images: piResultImages(block) }];
   });
 }
 
 /** The image types a chat shows; pi names the type `mimeType` where Claude names it `media_type`. */
-const PI_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-function piImageOf(value: unknown): { media_type: string; data: string } | null {
-  const image = record(value);
-  if (image.type !== "image") return null;
+const PI_IMAGE_TYPES: Record<string, true> = { "image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true };
+function piImageData(image: Row): PiImage | null {
   const type = typeof image.mimeType === "string" ? image.mimeType : typeof image.media_type === "string" ? image.media_type : null;
-  if (type === null || !PI_IMAGE_TYPES.has(type) || typeof image.data !== "string") return null;
+  if (type === null || PI_IMAGE_TYPES[type] !== true || typeof image.data !== "string") return null;
+  // A short signature probe rejects path-only data without decoding the whole image
+  // on each conversation poll. The reader checks the complete bytes and size again.
+  if (!BLOB_IMAGE_DATA.test(image.data) && (image.data.length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 4
+    || imageType(Buffer.from(image.data.slice(0, 16), "base64")) === null)) return null;
   return { media_type: type, data: image.data };
 }
 
-/**
- * The `index`th image of the tool result answering `toolCallId`, decoded. `message` must
- * come from piMessage: pi-family providers spell the content field differently, and the
- * page's ref was built from the normalised one, so reading a raw entry could answer with
- * the wrong block.
- */
-export function piImageBlock(message: Row, toolCallId: string, index: number): { media_type: string; data: string } | null {
-  if (piResults(message).every((result) => result.id !== toolCallId)) return null;
-  const blocks = message.role === "toolResult" ? [message] : (Array.isArray(message.content) ? message.content : []).filter((block) => record(block).type === "toolResult" && record(block).toolCallId === toolCallId);
-  const images = blocks.flatMap((value) => { const block = record(value); return (Array.isArray(block.content) ? block.content : []).map(piImageOf); }).filter((image): image is { media_type: string; data: string } => image !== null);
-  return index >= 0 ? images[index] ?? null : null;
+function piImageOf(value: unknown): PiImage | null {
+  const image = record(value);
+  return image.type === "image" ? piImageData(image) : null;
+}
+
+function piResultImages(block: Row): PiImage[] {
+  const images = (Array.isArray(block.content) ? block.content : []).map(piImageOf).filter((image): image is PiImage => image !== null);
+  const generated = record(record(record(block.details).xdev).inner).images;
+  for (const value of Array.isArray(generated) ? generated : []) {
+    const image = piImageData(record(value));
+    if (image !== null && BLOB_IMAGE_DATA.test(image.data)) images.push(image);
+  }
+  return images;
+}
+
+/** Only emit inline addresses the corresponding fetcher accepts. */
+function piImageRef(image: PiImage, inlineRef: string): string | null {
+  const blob = BLOB_IMAGE_DATA.exec(image.data);
+  return blob !== null ? `blob:${blob[1]}` : PI_IMAGE_REF.test(inlineRef) || PI_USER_IMAGE_REF.test(inlineRef) ? inlineRef : null;
+}
+
+/** The image of a normalized result, using the same ordinal as the page's ref. */
+export function piImageBlock(message: Row, toolCallId: string, index: number): PiImage | null {
+  const blocks = message.role === "toolResult" ? [message] : Array.isArray(message.content) ? message.content : [];
+  for (const value of blocks) {
+    const block = record(value);
+    if (block.toolCallId === toolCallId && (message.role === "toolResult" || block.type === "toolResult")) {
+      return index >= 0 ? piResultImages(block)[index] ?? null : null;
+    }
+  }
+  return null;
+}
+
+/** User images use the record's stable id, never its position in a page. */
+export function piUserImages(entry: unknown, message = piMessage(entry)): PiImage[] {
+  return message?.role === "user" && Array.isArray(message.content)
+    ? message.content.map(piImageOf).filter((image): image is PiImage => image !== null) : [];
+}
+
+export function piUserImageParts(entry: unknown, message = piMessage(entry)): Extract<ConversationPart, { kind: "image" }>[] {
+  return piUserImages(entry, message).flatMap((image, index) => {
+    const id = record(entry).id;
+    const ref = piImageRef(image, typeof id === "string" ? `pi-user:${id}:${index}` : "");
+    return ref === null ? [] : [{ kind: "image", media_type: image.media_type, ref }];
+  });
 }
 
 /** Enough turns for a conversation. */
@@ -296,10 +350,12 @@ export function parseOmpTranscript(text: string, maxTurns = MAX_TURNS, options: 
         pending.delete(result.id);
         trimOutput(tool, result.text, result.id);
         if (result.error) tool.error = true;
-        if (options.toolImages === true && result.images.length > 0) {
-          // addressed by the call it answers: a nested result shares its entry with other
-          // blocks, so the entry id alone could not say which one an image came from
-          tool.images = result.images.map((media_type, index) => ({ media_type, ref: `pi:${result.id}:${index}` }));
+        if (options.toolImages === true) {
+          const images = result.images.flatMap((image, index) => {
+            const ref = piImageRef(image, `pi:${result.id}:${index}`);
+            return ref === null ? [] : [{ media_type: image.media_type, ref }];
+          });
+          if (images.length > 0) tool.images = images;
         }
       }
     };
@@ -314,12 +370,13 @@ export function parseOmpTranscript(text: string, maxTurns = MAX_TURNS, options: 
               .map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
               .filter((part) => part.length > 0)
               .join("\n");
-      if (prompt.length === 0) continue; // image-only user parts have no text to show
+      const images = piUserImageParts(entry, message);
+      if (prompt.length === 0 && images.length === 0) continue;
       // a skill invocation reads as what the user asked, the skill as a chip on it: not as the
       // SKILL.md the runtime put before it. Kept on this record, so no page boundary can part them
       const invocation = skillInvocationPrompt(prompt);
       const asked = invocation === null ? prompt : invocation.request || invocation.skills.map((skill) => `/skill:${skill.name}`).join(" ");
-      turns.push({ role: "user", ts: timestamp ?? null, parts: [{ kind: "text", text: asked }, ...(invocation?.skills ?? []).map((skill) => ({ kind: "skill" as const, skill }))] });
+      turns.push({ role: "user", ts: timestamp ?? null, parts: [...images, ...(asked.length > 0 ? [{ kind: "text" as const, text: asked }] : []), ...(invocation?.skills ?? []).map((skill) => ({ kind: "skill" as const, skill }))] });
       continue;
     }
 

@@ -792,9 +792,10 @@ describe("parseOmpTranscript", () => {
     expect(rendered).not.toContain("프로젝트 불편사항 패치");
   });
 
-  it("skips an image-only user part instead of an empty turn", () => {
+  it("skips an unsupported path-only image carrier instead of an empty turn", () => {
     const turns = parseOmpTranscript(ompLines);
     expect(turns.filter((turn) => turn.role === "user")).toHaveLength(1);
+    expect(turns.flatMap((turn) => turn.parts).some((part) => part.kind === "image")).toBe(false);
   });
 
   it("falls back to the first interesting argument when a toolCall has no intent", () => {
@@ -1417,7 +1418,7 @@ describe("transcriptImage", () => {
     try {
       const path = join(dir, "session.jsonl");
       const uuid = "11111111-2222-3333-4444-555555555555";
-      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
       writeFileSync(path, [
         { type: "user", uuid: "99999999-2222-3333-4444-555555555555", message: { content: [{ type: "text", text: "x" }] } },
         { type: "user", uuid, message: { content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png.toString("base64") } }, { type: "text", text: "what?" }, { type: "image", source: { type: "base64", media_type: "image/svg+xml", data: "PHN2Zz4=" } }] } },

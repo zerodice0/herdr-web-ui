@@ -8,7 +8,7 @@ import nodePath, { isAbsolute, join, type PlatformPath } from "node:path";
 import type { ConversationPart, ConversationTurn, HerdrPane } from "../shared/protocol.ts";
 import { patchFiles, patchText } from "../shared/patch.ts";
 import { processStartedAt } from "./process-start.ts";
-import { codexImageParts } from "./codex-images.ts";
+import { codexImageParts, codexToolImageParts } from "./codex-images.ts";
 import { codexReadCall, codexReadSkills, selectedSkill } from "./skill-activity.ts";
 import { trimOutput } from "./tool-output.ts";
 import { agentGet, paneProcessInfo, paneRead, sessionSnapshot } from "./herdr/client.ts";
@@ -310,6 +310,8 @@ export function createCodexTranscriptParser(state: CodexParseState = { turns: []
         if (!tool) continue;
         const output = contentText(payload.output);
         trimOutput(tool, output, string(payload.call_id));
+        const images = codexToolImageParts(entry);
+        if (images.length > 0) tool.images = images;
         if (codexCallFailed(output)) tool.error = true;
         if (tool.skill) tool.skill.status = tool.error ? "failed" : "loaded";
         tools.delete(string(payload.call_id));

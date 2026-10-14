@@ -40,26 +40,28 @@ import nodePath, { type PlatformPath } from "node:path";
 import type { ConversationMetadata, ConversationPart, ConversationTurn, HerdrPane, SessionSnapshot } from "../shared/protocol.ts";
 import { herdrRpc, paneRead, sessionSnapshot } from "./herdr/client.ts";
 import { codexHistorySegments, createCodexTranscriptParser, codexOutputText, codexTranscriptPath, defaultCodexHome, forgetAllCodexState, forgetCodexStateFor, paneCodexHome, parseCodexTranscript, readRange } from "./codex.ts";
-import { CODEX_IMAGE_REF, codexTranscriptImage } from "./codex-images.ts";
+import { CODEX_IMAGE_REF, codexTranscriptImage, forgetCodexImageState } from "./codex-images.ts";
 import { AmbiguousClaudeStore, claudeProcessSession, claudeTranscriptFile, defaultClaudeConfigDir, forgetClaudeSessionFile, forgetClaudeSessions, isClaudeProcess, processClaudeConfigDir } from "./claude-store.ts";
 import { forgetGjcPane, forgetGjcState, gjcPidUnderShell, gjcTranscriptForPane, isGjcProcess, storeRelative } from "./gjc-runtime.ts";
 import { isOmoProcess, omoSessionForPane } from "./omo.ts";
 import { processStartedAt } from "./process-start.ts";
 import { ompHeldTranscript } from "./omp.ts";
+import { ompTranscriptImage, piImageInHistory } from "./omp-images.ts";
 import { forgetOpencodeRead, forgetOpencodeState, OPENCODE_IMAGE_REF, opencodeConversation, opencodeDatabasePath, opencodeImage, opencodeReadKey, opencodeSessionId, opencodeToolOutput } from "./opencode.ts";
 import { piTranscriptInStore, piTranscriptPath, unwrittenSession } from "./pi.ts";
-import { forgetAllPiIndexes, forgetPiIndex, piAbandonedTurns, piBranchSegments } from "./pi-tree.ts";
+import { forgetAllPiIndexes, forgetPiIndex, piAbandonedTurns, piBranchSegments, type TranscriptSegment } from "./pi-tree.ts";
 import { defaultDevinDbPath, DevinHistoryUnavailable, devinConversation, forgetDevinState } from "./devin.ts";
 import { forgetGrokState, grokProjection, grokToolOutput, parseGrokTranscript, GrokUnavailable } from "./grok.ts";
 import { resolveGrokStore } from "./grok-store.ts";
 import { AgyUnavailable, agyCatalog, agyToolOutput, forgetAgyState, parseAgyTranscript, withAgyHistory, type AgyProjection } from "./agy.ts";
 import { resolveAgyStore, sameAgyStore, type AgyStore } from "./agy-store.ts";
 import { trimOutput } from "./tool-output.ts";
+import { base64Image } from "./image-bytes.ts";
 import { parseConversationMetadata } from "./conversation-metadata.ts";
 import { forgetHermesTranscriptState, hermesConversationPage, hermesToolOutput, hermesTranscriptForPane } from "./hermes.ts";
 
 import { invokedSkill } from "./skill-activity.ts";
-import { agentTaskResult, claudePeerId, claudePeerNotice, isContextClear, MAX_TURNS, parseOmpTranscript, piImageBlock, piMessage, piResults, toolSummary } from "./transcript-records.ts";
+import { activeHistoryText, agentTaskResult, BLOB_IMAGE_REF, claudePeerId, claudePeerNotice, isContextClear, MAX_TURNS, parseOmpTranscript, PI_IMAGE_REF, PI_USER_IMAGE_REF, piMessage, piResults, piUserImageParts, toolSummary } from "./transcript-records.ts";
 import { forgetSubagents, lineNotifications, subagentDetails, taskNotification, type SubagentDetail } from "./claude-subagents.ts";
 import { launchedAgents } from "./launched-agents.ts";
 import { readsStartScreen, startScreenMetadata } from "./start-screen.ts";
@@ -243,6 +245,15 @@ function claudeResultText(output: unknown): string {
 /** The image types a chat shows; anything else stays out of the page. */
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
+/** Only inline bytes are image carriers; path-only tool output stays text. */
+function claudeImageSource(block: unknown): { media_type: string; data: string } | null {
+  if (typeof block !== "object" || block === null) return null;
+  const image = block as { type?: unknown; source?: { type?: unknown; media_type?: unknown; data?: unknown } };
+  const source = image.source;
+  if (image.type !== "image" || source?.type !== "base64" || typeof source.media_type !== "string" || !IMAGE_TYPES.has(source.media_type) || typeof source.data !== "string") return null;
+  return source as { media_type: string; data: string };
+}
+
 /**
  * Splits one transcript file's contents into turns. Adjacent assistant entries
  * merge into a single turn (text parts + tool parts); each tool_use is followed
@@ -386,7 +397,7 @@ export function parseClaudeTranscript(text: string, maxTurns = MAX_TURNS, option
         if (part.type === "text" && typeof part.text === "string" && notified(part.text, entry.timestamp ?? null)) return [];
         return part.type === "text" && typeof part.text === "string" && !isCommandEntry(part.text.trim()) ? [part.text] : [];
       }).join("\n");
-      for (const block of content) {
+      for (const [blockIndex, block] of content.entries()) {
         if (typeof block !== "object" || block === null) continue;
         const result = block as { type?: string; tool_use_id?: string; content?: unknown; is_error?: unknown };
         if (result.type !== "tool_result" || typeof result.tool_use_id !== "string") continue;
@@ -394,14 +405,22 @@ export function parseClaudeTranscript(text: string, maxTurns = MAX_TURNS, option
         if (tool === undefined) continue;
         pending.delete(result.tool_use_id);
         trimOutput(tool, claudeResultText(result.content), result.tool_use_id);
+        if (typeof entry.uuid === "string" && Array.isArray(result.content)) {
+          const images = result.content.flatMap((block: unknown, nestedIndex: number) => {
+            const ref = `${entry.uuid}:${blockIndex}:${nestedIndex}`;
+            const source = claudeImageSource(block);
+            return source !== null && IMAGE_REF.test(ref) ? [{ media_type: source.media_type, ref }] : [];
+          });
+          if (images.length > 0) tool.images = images;
+        }
         if (result.is_error === true) tool.error = true;
         if (tool.skill) tool.skill.status = result.is_error === true ? "failed" : "loaded";
       }
       // an image pasted into the prompt: named here, fetched only when shown
       const images: ConversationPart[] = typeof entry.uuid !== "string" ? [] : content.flatMap((block: unknown, index: number) => {
-        const image = block as { type?: unknown; source?: { type?: unknown; media_type?: unknown } } | null;
-        if (image?.type !== "image" || image.source?.type !== "base64" || typeof image.source.media_type !== "string" || !IMAGE_TYPES.has(image.source.media_type)) return [];
-        return [{ kind: "image" as const, media_type: image.source.media_type, ref: `${entry.uuid}:${index}` }];
+        const source = claudeImageSource(block);
+        const ref = `${entry.uuid}:${index}`;
+        return source !== null && IMAGE_REF.test(ref) ? [{ kind: "image" as const, media_type: source.media_type, ref }] : [];
       });
       if (prompt.trim() || images.length > 0) pushPrompt({ role: "user", ts: entry.timestamp ?? null, parts: [...images, ...(prompt.trim() ? [{ kind: "text" as const, text: unwrapPastes(prompt) }] : [])] }, entry);
       continue;
@@ -675,21 +694,25 @@ const TURN_MARK: Record<StreamSource, Buffer> = {
  * and the same for pi, whose prompts are `message` records with a user role.
  */
 function opensTurn(source: StreamSource, line: string): boolean {
-  let entry: { type?: unknown; isMeta?: unknown; isCompactSummary?: unknown; payload?: { type?: unknown }; message?: { role?: unknown; content?: unknown } };
+  let entry: { type?: unknown; uuid?: unknown; isMeta?: unknown; isCompactSummary?: unknown; payload?: { type?: unknown }; message?: { role?: unknown; content?: unknown } };
   try { entry = JSON.parse(line); } catch { return false; }
   if (entry === null || typeof entry !== "object") return false;
   if (source === "codex-transcript") return entry.type === "event_msg" && entry.payload?.type === "task_started";
   if (source !== "claude-transcript") {
     const message = piMessage(entry);
-    return message?.role === "user" && (message.content as Record<string, unknown>[]).some((part) => part.type === "text" && typeof part.text === "string" && part.text.length > 0);
+    return message?.role === "user" && ((message.content as Record<string, unknown>[]).some((part) => part.type === "text" && typeof part.text === "string" && part.text.length > 0)
+      || piUserImageParts(entry, message).length > 0);
   }
   // another session's message opens a turn in either of its forms, the meta entry and the queued attachment
   if (claudePeerNotice(entry) !== null) return true;
   if (entry.type !== "user" || entry.isMeta || entry.isCompactSummary) return false;
   const content = entry.message?.content;
   if (typeof content === "string") return !isCommandEntry(content);
-  return Array.isArray(content) && content.some((block: { type?: unknown; text?: unknown } | null) =>
-    block?.type === "text" && typeof block.text === "string" && !isCommandEntry(block.text.trim()));
+  return Array.isArray(content) && content.some((block: { type?: unknown; text?: unknown; source?: { type?: unknown; media_type?: unknown; data?: unknown } } | null, index: number) =>
+    (block?.type === "text" && typeof block.text === "string" && !isCommandEntry(block.text.trim()))
+    || (block?.type === "image" && block.source?.type === "base64" && typeof block.source.media_type === "string"
+      && IMAGE_TYPES.has(block.source.media_type) && typeof block.source.data === "string"
+      && typeof entry.uuid === "string" && IMAGE_REF.test(`${entry.uuid}:${index}`)));
 }
 
 /**
@@ -901,10 +924,8 @@ function parseTurns(source: RecognizedConversation["source"], path: string, text
   }
   if (source === "agy-transcript") return parseAgyTranscript(text, path);
   return source === "codex-transcript" ? parseCodexTranscript(text, Infinity)
-    // only pi keeps a tool's images in the entry as base64; omp, omo and gjc are read the same
-    // way but would carry image refs nothing can answer, so the option stays with pi alone
     : source === "claude-transcript" ? parseClaudeTranscript(text, Infinity, { subagents: subagentsOnPage(path, text), noticed })
-      : parseOmpTranscript(text, Infinity, { toolImages: source === "pi-transcript", taskTitles });
+      : parseOmpTranscript(text, Infinity, { toolImages: true, taskTitles });
 }
 
 interface LiveCodexTurn {
@@ -1018,6 +1039,7 @@ export function forgetTranscriptState(): void {
   clearScans.clear();
   paneReads.clear();
   forgetAllCodexState();
+  forgetCodexImageState();
   forgetAllPiIndexes();
   forgetGrokState();
   forgetAgyState();
@@ -1588,14 +1610,10 @@ function transcriptPageRead(source: StreamSource, path: string, page: Conversati
   return { source, turns, metadata, cursor, abandoned, history_id: stream.id, version };
 }
 
-/**
- * One image a user pasted into a Claude prompt, by the ref its image part carries
- * (`<entry uuid>:<block index>`): the transcript holds it as base64, so it is decoded
- * here rather than sent with every poll of the conversation. Null when there is no such
- * image. Codex uses a hash of the native attachment and searches only the bound history.
- */
+/** A recorded user/tool image, fetched only from the pane's bound, visible native history. */
 export async function conversationImage(paneId: string, ref: string, codexHome?: string, opencodeDb?: string): Promise<{ mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null> {
-  if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !PI_IMAGE_REF.test(ref) && !OPENCODE_IMAGE_REF.test(ref)) return null;
+  if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !PI_IMAGE_REF.test(ref) && !PI_USER_IMAGE_REF.test(ref)
+    && !BLOB_IMAGE_REF.test(ref) && !OPENCODE_IMAGE_REF.test(ref)) return null;
   const snapshot = await sessionSnapshot();
   const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId);
   if (pane === undefined || typeof pane.cwd !== "string" || pane.cwd.length === 0) return null;
@@ -1607,16 +1625,18 @@ export async function conversationImage(paneId: string, ref: string, codexHome?:
   rememberPaneRead(paneId, resolved.path);
   if (resolved.source === "codex-transcript") return codexTranscriptImage(codexHistorySegments(resolved.path, resolved.codexHome ?? codexHome), ref, pane.cwd);
   if (resolved.source === "pi-transcript") return piTranscriptImage(resolved.path, ref);
+  if (resolved.source === "omp-transcript" || resolved.source === "omo-transcript" || resolved.source === "gjc-transcript") return ompTranscriptImage(resolved.path, ref);
   return resolved.source === "claude-transcript" ? transcriptImage(resolved.path, ref) : null;
 }
 
-const IMAGE_REF = /^([0-9a-f-]{8,64}):(\d{1,3})$/i;
+/** A prompt block, or an image nested inside a tool-result block, in the same recorded entry. */
+const IMAGE_REF = /^([0-9a-f-]{8,64}):(\d{1,3})(?::(\d{1,3}))?$/i;
 
 /** The image an image part's ref names in a Claude transcript file, decoded; null when there is none. */
 export function transcriptImage(path: string, ref: string): { mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null {
   const match = IMAGE_REF.exec(ref);
   if (match === null) return null;
-  const [, uuid, index] = match;
+  const [, uuid, index, nestedIndex] = match;
   let text: string;
   try { text = readFileSync(path, "utf8"); } catch { return null; }
   text = activeHistoryText(text, "claude-transcript");
@@ -1625,12 +1645,16 @@ export function transcriptImage(path: string, ref: string): { mediaType: string;
     if (!line.includes(needle)) continue;
     let entry: TranscriptEntry;
     try { entry = JSON.parse(line) as TranscriptEntry; } catch { continue; }
-    if (entry.uuid !== uuid || !Array.isArray(entry.message?.content)) continue;
-    const block = entry.message.content[Number(index)] as { type?: unknown; source?: { type?: unknown; media_type?: unknown; data?: unknown } } | undefined;
-    if (block?.type !== "image" || block.source?.type !== "base64" || typeof block.source.data !== "string") return null;
-    const mediaType = String(block.source.media_type);
-    if (!IMAGE_TYPES.has(mediaType)) return null;
-    return { mediaType, bytes: new Uint8Array(Buffer.from(block.source.data, "base64")) };
+    if (entry?.type !== "user" || entry.isMeta || entry.isCompactSummary || entry.uuid !== uuid || !Array.isArray(entry.message?.content)) continue;
+    let block: unknown = entry.message.content[Number(index)];
+    if (nestedIndex !== undefined) {
+      if (typeof block !== "object" || block === null) return null;
+      const result = block as { type?: unknown; content?: unknown };
+      if (result.type !== "tool_result" || !Array.isArray(result.content)) return null;
+      block = result.content[Number(nestedIndex)];
+    }
+    const source = claudeImageSource(block);
+    return source === null ? null : base64Image(source.data);
   }
   return null;
 }
@@ -1705,38 +1729,28 @@ function piToolOutput(path: string, ref: string): string | null {
 }
 
 /**
- * The image a pi tool call returned, by the ref the page gave it (`pi:<call id>:<nth image>`).
- * Like the output, it is read on the active branch only: an image from a branch a /tree
- * abandoned is one the chat never showed, so it is not offered.
+ * A recorded pi user/tool image is read on the active branch only. The complete
+ * projected history shares /clear's boundary before either inline or blob bytes
+ * are fetched, so neither abandoned branches nor earlier context remain exposed.
  */
 export function piTranscriptImage(path: string, ref: string): { mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null {
-  const match = PI_IMAGE_REF.exec(ref);
-  if (match === null || match[1] === undefined || match[2] === undefined) return null;
-  const [, callId, nth] = match;
-  let size: number;
-  let branch: ReturnType<typeof piBranchSegments>;
-  try { size = statSync(path).size; branch = piBranchSegments(path, size); } catch { return null; }
+  if (!PI_IMAGE_REF.test(ref) && !PI_USER_IMAGE_REF.test(ref) && !BLOB_IMAGE_REF.test(ref)) return null;
+  let branch: TranscriptSegment[] | null;
+  try { branch = piBranchSegments(path, statSync(path).size); } catch { return null; }
   if (branch === null) return null;
-  const fd = openSync(path, "r");
+  const chunks: string[] = [];
+  let fd: number;
+  try { fd = openSync(path, "r"); } catch { return null; }
   try {
     for (const segment of branch) {
       const buffer = Buffer.alloc(segment.end - segment.start);
-      if (readSync(fd, buffer, 0, buffer.length, segment.start) !== buffer.length) continue;
-      for (const line of buffer.toString("utf8").split("\n")) {
-        if (!line.includes(callId)) continue;
-        let entry: unknown;
-        try { entry = JSON.parse(line); } catch { continue; }
-        const message = piMessage(entry);
-        if (message === null) continue;
-        const image = piImageBlock(message, callId, Number(nth));
-        if (image !== null) return { mediaType: image.media_type, bytes: new Uint8Array(Buffer.from(image.data, "base64")) };
-      }
+      if (readSync(fd, buffer, 0, buffer.length, segment.start) !== buffer.length) return null;
+      chunks.push(buffer.toString("utf8"));
     }
-  } finally { closeSync(fd); }
-  return null;
+  } catch { return null; }
+  finally { closeSync(fd); }
+  return piImageInHistory(path, ref, activeHistoryText(chunks.join("\n"), "pi-transcript"));
 }
-
-const PI_IMAGE_REF = /^pi:([A-Za-z0-9_:.\-]{1,128}):(\d{1,3})$/;
 
 function outputInText(source: RecognizedConversation["source"], text: string, ref: string): string | null {
   text = activeHistoryText(text, source);
@@ -1762,15 +1776,3 @@ function outputInText(source: RecognizedConversation["source"], text: string, re
   return null;
 }
 
-/** Asset reads share the reset boundary even when their ref predates /clear. */
-function activeHistoryText(text: string, source: RecognizedConversation["source"]): string {
-  if (source === "codex-transcript") return text;
-  let start = 0, offset = 0;
-  for (const line of text.split("\n")) {
-    if (line.includes("context_clear") || line.includes("/clear")) {
-      try { if (isContextClear(JSON.parse(line), source)) start = offset + line.length + 1; } catch { /* torn line */ }
-    }
-    offset += line.length + 1;
-  }
-  return text.slice(start);
-}
